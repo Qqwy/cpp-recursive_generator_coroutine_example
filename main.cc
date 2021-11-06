@@ -1,6 +1,7 @@
 #include <string>
 #include <string_view>
 #include <dirent.h>
+#include <iostream>
 
 #include "generator.hh"
 
@@ -10,7 +11,7 @@ bool is_special(struct dirent const &entry)
 }
 
 /// We yield all `dirent`s contained in the particular `path` (as long as it is a directory)
-inline generator<struct dirent> directory_entries(std::string_view path)
+inline cppcoro::generator<struct dirent> directory_entries(std::string_view path)
 {
   DIR *dir_handle = opendir(path.data());
 
@@ -31,7 +32,7 @@ inline generator<struct dirent> directory_entries(std::string_view path)
 
 /// It often is useful to keep track of the _full_ path rather than only the entry's own name
 /// So we wrap above generator with one that returns the full path for each dirent.
-inline generator<std::pair<struct dirent, std::string_view>> directory_entries_with_paths(std::string_view path)
+inline cppcoro::generator<std::pair<struct dirent, std::string_view>> directory_entries_with_paths(std::string_view path)
 {
   for (auto const &entry : directory_entries(path))
   {
@@ -45,9 +46,9 @@ inline generator<std::pair<struct dirent, std::string_view>> directory_entries_w
 /// We yield all entries in the current directory
 /// and whenever we find that one of these entries is itself a directory,
 /// we recurse with this new directory path.
-inline generator<std::pair<struct dirent, std::string_view>> recursive_directory_entries(std::string_view path)
+inline cppcoro::recursive_generator<std::pair<struct dirent, std::string_view>> recursive_directory_entries(std::string_view path)
 {
-  for (auto const &entry_pair : directory_entries_with_paths(path))
+  for (auto &entry_pair : directory_entries_with_paths(path))
   {
     co_yield entry_pair;
 

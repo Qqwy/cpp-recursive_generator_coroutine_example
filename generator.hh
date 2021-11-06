@@ -1,222 +1,614 @@
-#ifndef COROUTINE_GENERATOR_H
-#define COROUTINE_GENERATOR_H
-
-// This recursive generator coroutine implementation
-// is extracted from https://github.com/Eren121/CPP20Coroutines
-
-#include <cassert>
-#include <optional>
-#include <iostream>
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (c) Lewis Baker
+// Licenced under MIT license. See LICENSE.txt for details.
+///////////////////////////////////////////////////////////////////////////////
+#ifndef CPPCORO_GENERATOR_HPP_INCLUDED
+#define CPPCORO_GENERATOR_HPP_INCLUDED
 
 #if __has_include(<coroutine>)
 #include <coroutine>
 #else
 #include <experimental/coroutine>
 namespace std {
-  using std::experimental::suspend_always;
-  using std::experimental::suspend_never;
-  using std::experimental::noop_coroutine;
-  using std::experimental::coroutine_handle;
-}
+using std::experimental::coroutine_handle;
+using std::experimental::noop_coroutine;
+using std::experimental::suspend_always;
+using std::experimental::suspend_never;
+} // namespace std
 #endif // __has_include(<coroutine>)
 
-class suspend_maybe
+#include <type_traits>
+#include <utility>
+#include <exception>
+#include <iterator>
+#include <functional>
+
+namespace cppcoro
 {
-private:
-  bool suspend_;
+	template<typename T>
+	class generator;
 
-public:
-  suspend_maybe(bool suspend) : suspend_(suspend) {}
+	namespace detail
+	{
+		template<typename T>
+		class generator_promise
+		{
+		public:
 
-  bool await_ready() const noexcept { return !suspend_; }
-  constexpr void await_suspend(std::coroutine_handle<>) const noexcept {}
-  constexpr void await_resume() const noexcept {}
-};
+			using value_type = std::remove_reference_t<T>;
+			using reference_type = std::conditional_t<std::is_reference_v<T>, T, T&>;
+			using pointer_type = value_type*;
 
-template<typename T>
-class generator
+			generator_promise() = default;
+
+			generator<T> get_return_object() noexcept;
+
+			constexpr std::suspend_always initial_suspend() const noexcept { return {}; }
+			constexpr std::suspend_always final_suspend() const noexcept { return {}; }
+
+			template<
+				typename U = T,
+				std::enable_if_t<!std::is_rvalue_reference<U>::value, int> = 0>
+			std::suspend_always yield_value(std::remove_reference_t<T>& value) noexcept
+			{
+				m_value = std::addressof(value);
+				return {};
+			}
+
+			std::suspend_always yield_value(std::remove_reference_t<T>&& value) noexcept
+			{
+				m_value = std::addressof(value);
+				return {};
+			}
+
+			void unhandled_exception()
+			{
+				m_exception = std::current_exception();
+			}
+
+			void return_void()
+			{
+			}
+
+			reference_type value() const noexcept
+			{
+				return static_cast<reference_type>(*m_value);
+			}
+
+			// Don't allow any use of 'co_await' inside the generator coroutine.
+			template<typename U>
+			std::suspend_never await_transform(U&& value) = delete;
+
+			void rethrow_if_exception()
+			{
+				if (m_exception)
+				{
+					std::rethrow_exception(m_exception);
+				}
+			}
+
+		private:
+
+			pointer_type m_value;
+			std::exception_ptr m_exception;
+
+		};
+
+        struct generator_sentinel {};
+
+		template<typename T>
+		class generator_iterator
+		{
+			using coroutine_handle = std::coroutine_handle<generator_promise<T>>;
+
+		public:
+
+			using iterator_category = std::input_iterator_tag;
+			// What type should we use for counting elements of a potentially infinite sequence?
+			using difference_type = std::ptrdiff_t;
+			using value_type = typename generator_promise<T>::value_type;
+			using reference = typename generator_promise<T>::reference_type;
+			using pointer = typename generator_promise<T>::pointer_type;
+
+			// Iterator needs to be default-constructible to satisfy the Range concept.
+			generator_iterator() noexcept
+				: m_coroutine(nullptr)
+			{}
+			
+			explicit generator_iterator(coroutine_handle coroutine) noexcept
+				: m_coroutine(coroutine)
+			{}
+
+			friend bool operator==(const generator_iterator& it, generator_sentinel) noexcept
+			{
+				return !it.m_coroutine || it.m_coroutine.done();
+			}
+
+			friend bool operator!=(const generator_iterator& it, generator_sentinel s) noexcept
+			{
+				return !(it == s);
+			}
+
+			friend bool operator==(generator_sentinel s, const generator_iterator& it) noexcept
+			{
+				return (it == s);
+			}
+
+			friend bool operator!=(generator_sentinel s, const generator_iterator& it) noexcept
+			{
+				return it != s;
+			}
+
+			generator_iterator& operator++()
+			{
+				m_coroutine.resume();
+				if (m_coroutine.done())
+				{
+					m_coroutine.promise().rethrow_if_exception();
+				}
+
+				return *this;
+			}
+
+			// Need to provide post-increment operator to implement the 'Range' concept.
+			void operator++(int)
+			{
+				(void)operator++();
+			}
+
+			reference operator*() const noexcept
+			{
+				return m_coroutine.promise().value();
+			}
+
+			pointer operator->() const noexcept
+			{
+				return std::addressof(operator*());
+			}
+
+		private:
+
+			coroutine_handle m_coroutine;
+		};
+	}
+
+	template<typename T>
+	class [[nodiscard]] generator
+	{
+	public:
+
+		using promise_type = detail::generator_promise<T>;
+		using iterator = detail::generator_iterator<T>;
+
+		generator() noexcept
+			: m_coroutine(nullptr)
+		{}
+
+		generator(generator&& other) noexcept
+			: m_coroutine(other.m_coroutine)
+		{
+			other.m_coroutine = nullptr;
+		}
+
+		generator(const generator& other) = delete;
+
+		~generator()
+		{
+			if (m_coroutine)
+			{
+				m_coroutine.destroy();
+			}
+		}
+
+		generator& operator=(generator other) noexcept
+		{
+			swap(other);
+			return *this;
+		}
+
+		iterator begin()
+		{
+			if (m_coroutine)
+			{
+				m_coroutine.resume();
+				if (m_coroutine.done())
+				{
+					m_coroutine.promise().rethrow_if_exception();
+				}
+			}
+
+			return iterator{ m_coroutine };
+		}
+
+		detail::generator_sentinel end() noexcept
+		{
+			return detail::generator_sentinel{};
+		}
+
+		void swap(generator& other) noexcept
+		{
+			std::swap(m_coroutine, other.m_coroutine);
+		}
+
+	private:
+
+		friend class detail::generator_promise<T>;
+
+		explicit generator(std::coroutine_handle<promise_type> coroutine) noexcept
+			: m_coroutine(coroutine)
+		{}
+
+		std::coroutine_handle<promise_type> m_coroutine;
+
+	};
+
+	template<typename T>
+	void swap(generator<T>& a, generator<T>& b)
+	{
+		a.swap(b);
+	}
+
+	namespace detail
+	{
+		template<typename T>
+		generator<T> generator_promise<T>::get_return_object() noexcept
+		{
+			using coroutine_handle = std::coroutine_handle<generator_promise<T>>;
+			return generator<T>{ coroutine_handle::from_promise(*this) };
+		}
+	}
+
+	template<typename FUNC, typename T>
+	generator<std::invoke_result_t<FUNC&, typename generator<T>::iterator::reference>> fmap(FUNC func, generator<T> source)
+	{
+		for (auto&& value : source)
+		{
+			co_yield std::invoke(func, static_cast<decltype(value)>(value));
+		}
+	}
+}
+
+#endif
+
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (c) Lewis Baker
+// Licenced under MIT license. See LICENSE.txt for details.
+///////////////////////////////////////////////////////////////////////////////
+#ifndef CPPCORO_RECURSIVE_GENERATOR_HPP_INCLUDED
+#define CPPCORO_RECURSIVE_GENERATOR_HPP_INCLUDED
+
+#include <type_traits>
+#include <utility>
+#include <cassert>
+#include <functional>
+
+namespace cppcoro
 {
-public:
-    struct promise_type
-    {
-        std::optional<T> t_;
+	template<typename T>
+	class [[nodiscard]] recursive_generator
+	{
+	public:
 
-        std::optional<generator> innerCoroutine_;
+		class promise_type final
+		{
+		public:
 
-        promise_type() = default;
-        ~promise_type() = default;
+			promise_type() noexcept
+				: m_value(nullptr)
+				, m_exception(nullptr)
+				, m_root(this)
+				, m_parentOrLeaf(this)
+			{}
 
-        std::suspend_always initial_suspend() { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        [[noreturn]] void unhandled_exception() { throw; }
-        generator get_return_object() { return {std::coroutine_handle<promise_type>::from_promise(*this)}; }
+			promise_type(const promise_type&) = delete;
+			promise_type(promise_type&&) = delete;
 
-        std::suspend_always yield_value(T t) { t_ = std::move(t); return {}; }
-        void return_void() {}
+			auto get_return_object() noexcept
+			{
+				return recursive_generator<T>{ *this };
+			}
 
-        suspend_maybe yield_value(generator innerCoroutine)
-        {
-            innerCoroutine_ = std::move(innerCoroutine);
+			std::suspend_always initial_suspend() noexcept
+			{
+				return {};
+			}
 
-            // Get first return value of the inner coroutine
-            if(!innerCoroutine_->is_resumable())
-            {
-                // coroutine is default-constructed (why TF yielding it), cancel it and do not suspend
-                innerCoroutine_ = {};
-                return false;
-            }
-            else
-            {
-                // the coroutine is valid; run it to get the first yield (or until end)
-                innerCoroutine_->operator()();
+			std::suspend_always final_suspend() noexcept
+			{
+				return {};
+			}
 
-                if(!innerCoroutine_->is_resumable())
-                {
-                    // the coroutine has yielded no value and is already ended, cancel it and do not suspend
-                    innerCoroutine_ = {};
-                    return false;
-                }
-                else
-                {
-                    t_ = std::move(innerCoroutine_->get()); // the coroutine has yield its first value; save it
-                    return true;
-                }
-            }
-        }
-    };
-private:
-    std::coroutine_handle<promise_type> h_;
+			void unhandled_exception() noexcept
+			{
+				m_exception = std::current_exception();
+			}
 
-    generator(std::coroutine_handle<promise_type> h) : h_(h) {}
+			void return_void() noexcept {}
 
-public:
-    explicit generator() = default;
+			std::suspend_always yield_value(T& value) noexcept
+			{
+				m_value = std::addressof(value);
+				return {};
+			}
 
-    // ------ Prevent copies
-    generator(const generator&) = delete;
-    generator& operator=(const generator&) = delete;
+			std::suspend_always yield_value(T&& value) noexcept
+			{
+				m_value = std::addressof(value);
+				return {};
+			}
 
-    // ------ Allow moves
-    generator(generator&& other) noexcept
-    {
-        std::swap(h_, other.h_);
-    }
+			auto yield_value(recursive_generator&& generator) noexcept
+			{
+				return yield_value(generator);
+			}
 
-    generator& operator=(generator&& other) noexcept
-    {
-        std::swap(h_, other.h_);
-        return *this;
-    }
+			auto yield_value(recursive_generator& generator) noexcept
+			{
+				struct awaitable
+				{
 
-    ~generator()
-    {
-        if(h_)
-        {
-            h_.destroy();
-            h_ = {};
-        }
-    }
+					awaitable(promise_type* childPromise)
+						: m_childPromise(childPromise)
+					{}
 
-    bool is_resumable() const
-    {
-        return h_ && !h_.done();
-    }
+					bool await_ready() noexcept
+					{
+						return this->m_childPromise == nullptr;
+					}
 
-    bool operator()()
-    {
-        return resume();
-    }
+					void await_suspend(std::coroutine_handle<promise_type>) noexcept
+					{}
 
-    bool resume()
-    {
-        assert(is_resumable());
+					void await_resume()
+					{
+						if (this->m_childPromise != nullptr)
+						{
+							this->m_childPromise->throw_if_exception();
+						}
+					}
 
-        if(h_.promise().innerCoroutine_)
-        {
-            // The coroutine has yielded another inner coroutine that is not finished yet
-            // run it until next yield or its end
+				private:
+					promise_type* m_childPromise;
+				};
 
-            h_.promise().innerCoroutine_->resume();
-            if(h_.promise().innerCoroutine_->is_resumable())
-            {
-                h_.promise().t_ = std::move(h_.promise().innerCoroutine_->get()); // yielded a value - save it
+				if (generator.m_promise != nullptr)
+				{
+					m_root->m_parentOrLeaf = generator.m_promise;
+					generator.m_promise->m_root = m_root;
+					generator.m_promise->m_parentOrLeaf = this;
+					generator.m_promise->resume();
 
-                return true;
-            }
-            else
-            {
-                h_.promise().innerCoroutine_ = {};
-                h_(); // inner coroutine has stopped - continue main coroutine
+					if (!generator.m_promise->is_complete())
+					{
+						return awaitable{ generator.m_promise };
+					}
 
-                return !h_.done();
-            }
-        }
-        else
-        {
-            h_();
+					m_root->m_parentOrLeaf = this;
+				}
 
-            return !h_.done();
-        }
-    }
+				return awaitable{ nullptr };
+			}
 
-    [[nodiscard]] const T& get() const
-    {
-        return h_.promise().t_.value();
-    }
+			// Don't allow any use of 'co_await' inside the recursive_generator coroutine.
+			template<typename U>
+			std::suspend_never await_transform(U&& value) = delete;
 
-    [[nodiscard]] T& get() // Allow movable
-    {
-        return h_.promise().t_.value();
-    }
+			void destroy() noexcept
+			{
+				std::coroutine_handle<promise_type>::from_promise(*this).destroy();
+			}
 
-    // ----------------- Range based loop stuff
+			void throw_if_exception()
+			{
+				if (m_exception != nullptr)
+				{
+					std::rethrow_exception(std::move(m_exception));
+				}
+			}
 
-    class iterator
-    {
-    public:
-        using iterator_category = std::input_iterator_tag;
-        using difference_type = std::ptrdiff_t;
-        using value_type = T;
-        using pointer = value_type*;
-        using reference = value_type&;
+			bool is_complete() noexcept
+			{
+				return std::coroutine_handle<promise_type>::from_promise(*this).done();
+			}
 
-        iterator(generator* gen = nullptr) : gen_(gen)
-        {
-            if(gen_)
-            {
-                if(!gen_->is_resumable())
-                {
-                    gen_ = nullptr; // gen_ is an default-constructed generator
-                }
-                else
-                {
-                    ++(*this); // Since the generator does not run at creation, run until first yield (or until end)
-                }
-            }
-        }
+			T& value() noexcept
+			{
+				assert(this == m_root);
+				assert(!is_complete());
+				return *(m_parentOrLeaf->m_value);
+			}
 
-        auto& operator*() const { return gen_->get(); }
+			void pull() noexcept
+			{
+				assert(this == m_root);
+				assert(!m_parentOrLeaf->is_complete());
 
-        bool operator==(const iterator&) const = default;
+				m_parentOrLeaf->resume();
 
-        iterator& operator++()
-        {
-            gen_->resume();
-            if(!gen_->is_resumable())
-            {
-                gen_ = nullptr;
-            }
+				while (m_parentOrLeaf != this && m_parentOrLeaf->is_complete())
+				{
+					m_parentOrLeaf = m_parentOrLeaf->m_parentOrLeaf;
+					m_parentOrLeaf->resume();
+				}
+			}
 
-            return *this;
-        }
+		private:
 
-    private:
+			void resume() noexcept
+			{
+				std::coroutine_handle<promise_type>::from_promise(*this).resume();
+			}
 
-        generator* gen_; // If set to nullptr, this is an end pointer
-    };
+			std::add_pointer_t<T> m_value;
+			std::exception_ptr m_exception;
 
-    iterator begin() { return {this}; }
-    iterator end() { return {}; }
-};
+			promise_type* m_root;
+
+			// If this is the promise of the root generator then this field
+			// is a pointer to the leaf promise.
+			// For non-root generators this is a pointer to the parent promise.
+			promise_type* m_parentOrLeaf;
+
+		};
+
+		recursive_generator() noexcept
+			: m_promise(nullptr)
+		{}
+
+		recursive_generator(promise_type& promise) noexcept
+			: m_promise(&promise)
+		{}
+
+		recursive_generator(recursive_generator&& other) noexcept
+			: m_promise(other.m_promise)
+		{
+			other.m_promise = nullptr;
+		}
+
+		recursive_generator(const recursive_generator& other) = delete;
+		recursive_generator& operator=(const recursive_generator& other) = delete;
+
+		~recursive_generator()
+		{
+			if (m_promise != nullptr)
+			{
+				m_promise->destroy();
+			}
+		}
+
+		recursive_generator& operator=(recursive_generator&& other) noexcept
+		{
+			if (this != &other)
+			{
+				if (m_promise != nullptr)
+				{
+					m_promise->destroy();
+				}
+
+				m_promise = other.m_promise;
+				other.m_promise = nullptr;
+			}
+
+			return *this;
+		}
+
+		class iterator
+		{
+		public:
+
+			using iterator_category = std::input_iterator_tag;
+			// What type should we use for counting elements of a potentially infinite sequence?
+			using difference_type = std::ptrdiff_t;
+			using value_type = std::remove_reference_t<T>;
+			using reference = std::conditional_t<std::is_reference_v<T>, T, T&>;
+			using pointer = std::add_pointer_t<T>;
+
+			iterator() noexcept
+				: m_promise(nullptr)
+			{}
+
+			explicit iterator(promise_type* promise) noexcept
+				: m_promise(promise)
+			{}
+
+			bool operator==(const iterator& other) const noexcept
+			{
+				return m_promise == other.m_promise;
+			}
+
+			bool operator!=(const iterator& other) const noexcept
+			{
+				return m_promise != other.m_promise;
+			}
+
+			iterator& operator++()
+			{
+				assert(m_promise != nullptr);
+				assert(!m_promise->is_complete());
+
+				m_promise->pull();
+				if (m_promise->is_complete())
+				{
+					auto* temp = m_promise;
+					m_promise = nullptr;
+					temp->throw_if_exception();
+				}
+
+				return *this;
+			}
+
+			void operator++(int)
+			{
+				(void)operator++();
+			}
+
+			reference operator*() const noexcept
+			{
+				assert(m_promise != nullptr);
+				return static_cast<reference>(m_promise->value());
+			}
+
+			pointer operator->() const noexcept
+			{
+				return std::addressof(operator*());
+			}
+
+		private:
+
+			promise_type* m_promise;
+
+		};
+
+		iterator begin()
+		{
+			if (m_promise != nullptr)
+			{
+				m_promise->pull();
+				if (!m_promise->is_complete())
+				{
+					return iterator(m_promise);
+				}
+
+				m_promise->throw_if_exception();
+			}
+
+			return iterator(nullptr);
+		}
+
+		iterator end() noexcept
+		{
+			return iterator(nullptr);
+		}
+
+		void swap(recursive_generator& other) noexcept
+		{
+			std::swap(m_promise, other.m_promise);
+		}
+
+	private:
+
+		friend class promise_type;
+
+		promise_type* m_promise;
+
+	};
+
+	template<typename T>
+	void swap(recursive_generator<T>& a, recursive_generator<T>& b) noexcept
+	{
+		a.swap(b);
+	}
+
+	// Note: When applying fmap operator to a recursive_generator we just yield a non-recursive
+	// generator since we generally won't be using the result in a recursive context.
+	template<typename FUNC, typename T>
+	generator<std::invoke_result_t<FUNC&, typename recursive_generator<T>::iterator::reference>> fmap(FUNC func, recursive_generator<T> source)
+	{
+		for (auto&& value : source)
+		{
+			co_yield std::invoke(func, static_cast<decltype(value)>(value));
+		}
+	}
+}
 
 #endif
