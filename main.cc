@@ -20,9 +20,8 @@ inline generator<struct dirent> directory_entries(std::string_view path)
 
   while (auto dir_entry = readdir(dir_handle))
   {
-    if (is_special(*dir_entry)) {
+    if (is_special(*dir_entry))
       continue;
-    }
 
     co_yield *dir_entry;
   }
