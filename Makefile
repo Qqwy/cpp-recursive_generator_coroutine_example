@@ -1,12 +1,12 @@
 all: gcc clang
 
 clang:
-	 clang++ -std=c++20 -o gor_clang -Wall -Werror -stdlib=libc++ -O2 -g gor.cc
+	 clang++ -std=c++20 -o readdir_clang -Wall -Werror -stdlib=libc++ -O2 -g main.cc
 
 gcc:
-	g++ -std=c++20 -o gor_gcc -Wall -Werror -O2 -g gor.cc
+	g++ -std=c++20 -o readdir_gcc -Wall -Werror -O2 -g main.cc
 
 clean:
-	rm gor_gcc 
-	rm gor_clang 
+	rm readdir_clang 
+	rm readdir_gcc
 
