@@ -1,6 +1,9 @@
 #ifndef COROUTINE_GENERATOR_H
 #define COROUTINE_GENERATOR_H
 
+// This recursive generator coroutine implementation
+// is extracted from https://github.com/Eren121/CPP20Coroutines
+
 #include <cassert>
 #include <optional>
 #include <iostream>
