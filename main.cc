@@ -28,7 +28,7 @@ inline generator<struct dirent> directory_entries(std::string_view path)
 
 /// It often is useful to keep track of the _full_ path rather than only the entry's own name
 /// So we wrap above generator with one that returns the full path for each dirent.
-inline generator<std::pair<struct dirent, std::string>> directory_entries_with_paths(std::string_view path)
+inline generator<std::pair<struct dirent, std::string_view>> directory_entries_with_paths(std::string_view path)
 {
   for (auto const &entry : directory_entries(path))
   {
@@ -37,18 +37,20 @@ inline generator<std::pair<struct dirent, std::string>> directory_entries_with_p
   }
 }
 
-/// We now have enough info to recurse through the directory tree
-inline generator<std::pair<struct dirent, std::string>> recursive_directory_entries(std::string_view path)
+/// We now have enough info to recurse through the directory tree:
+///
+/// We yield all entries in the current directory
+/// and whenever we find that one of these entries is itself a directory,
+/// we recurse with this new directory path.
+inline generator<std::pair<struct dirent, std::string_view>> recursive_directory_entries(std::string_view path)
 {
   for (auto const &entry_pair : directory_entries_with_paths(path))
   {
-    auto [entry, entry_path] = entry_pair;
-
     co_yield entry_pair;
 
+    auto [entry, entry_path] = entry_pair;
     if(entry.d_type == DT_DIR)
     {
-      // Yielding a generator means that we yield _all_ of its values before continuing
       co_yield recursive_directory_entries(entry_path);
     }
   }
