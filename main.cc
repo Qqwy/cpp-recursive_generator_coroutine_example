@@ -5,9 +5,9 @@
 
 #include "generator.hh"
 
-bool is_special(struct dirent const &entry)
+inline bool is_special(struct dirent const &entry)
 {
-  return entry.d_name == std::string(".") || entry.d_name == std::string("..");
+  return entry.d_name == std::string_view(".") || entry.d_name == std::string_view("..");
 }
 
 /// We yield all `dirent`s contained in the particular `path` (as long as it is a directory)
