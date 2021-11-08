@@ -1,0 +1,419 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="486" onload="init(evt)" viewBox="0 0 1200 486" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:"Verdana"; font-size:12px; fill:rgb(0,0,0); }
+#title { text-anchor:middle; font-size:17px; }
+#search { opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[var nametype = 'Function:';
+var fontsize = 12;
+var fontwidth = 0.59;
+var xpad = 10;
+var inverted = false;
+var searchcolor = 'rgb(230,0,230)';
+var fluiddrawing = true;
+var truncate_text_right = false;]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+          svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            var el = frames.children;
+            for(var i = 0; i < el.length; i++) {
+                update_text(el[i]);
+            }
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad - 100;
+            matchedtxt.attributes.x.value = svgWidth - xpad - 100;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+            var params = get_params()
+            params.x = el.attributes._orig_x.value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["_orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("_orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["_orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+    e.removeAttribute("_orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (/^ *\$/.test(txt) || t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.attributes != undefined) {
+        orig_load(e, "x");
+        orig_load(e, "width");
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, ratio) {
+    if (e.attributes != undefined) {
+        if (e.attributes.x != undefined) {
+            orig_save(e, "x");
+            e.attributes.x.value = format_percent((parseFloat(e.attributes.x.value) - x) * ratio);
+            if (e.tagName == "text") {
+                e.attributes.x.value = format_percent(parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value) + (100 * 3 / frames.attributes.width.value));
+            }
+        }
+        if (e.attributes.width != undefined) {
+            orig_save(e, "width");
+            e.attributes.width.value = format_percent(parseFloat(e.attributes.width.value) * ratio);
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, ratio);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            orig_save(e, "x");
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            orig_save(e, "width");
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseFloat(attr.width.value);
+    var xmin = parseFloat(attr.x.value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    var ratio = 100 / width;
+    // XXX: Workaround for JavaScript float issues (fix me)
+    var fudge = 0.001;
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseFloat(a.x.value);
+        var ew = parseFloat(a.width.value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                update_text(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex + fudge >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, ratio);
+                update_text(e);
+            }
+        }
+    }
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+        update_text(el[i]);
+    }
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseFloat(rect.attributes.width.value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseFloat(rect.attributes.x.value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    var fudge = 0.0001;    // JavaScript floating point
+    for (var k in keys) {
+        var x = parseFloat(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw - fudge) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="486" fill="url(#background)"/><text id="title" x="50.0000%" y="24.00">Flame Graph</text><text id="details" x="10" y="469.00"> </text><text id="unzoom" class="hide" x="10" y="24.00">Reset Zoom</text><text id="search" x="1090" y="24.00">Search</text><text id="matched" x="1090" y="469.00"> </text><svg id="frames" x="10" width="1180"><g><title>__GI___getdents64 (33 samples, 0.31%)</title><rect x="0.0473%" y="389" width="0.3121%" height="15" fill="rgb(227,0,7)"/><text x="0.2973%" y="399.50"></text></g><g><title>__GI___libc_free (23 samples, 0.22%)</title><rect x="0.3593%" y="389" width="0.2175%" height="15" fill="rgb(217,0,24)"/><text x="0.6093%" y="399.50"></text></g><g><title>__GI___libc_malloc (27 samples, 0.26%)</title><rect x="0.5768%" y="389" width="0.2553%" height="15" fill="rgb(221,193,54)"/><text x="0.8268%" y="399.50"></text></g><g><title>__memmove_avx_unaligned_erms (15 samples, 0.14%)</title><rect x="0.9362%" y="389" width="0.1418%" height="15" fill="rgb(248,212,6)"/><text x="1.1862%" y="399.50"></text></g><g><title>__readdir64 (38 samples, 0.36%)</title><rect x="1.0780%" y="389" width="0.3593%" height="15" fill="rgb(208,68,35)"/><text x="1.3280%" y="399.50"></text></g><g><title>_int_free (54 samples, 0.51%)</title><rect x="1.4374%" y="389" width="0.5106%" height="15" fill="rgb(232,128,0)"/><text x="1.6874%" y="399.50"></text></g><g><title>directory_entries (65 samples, 0.61%)</title><rect x="1.9669%" y="389" width="0.6147%" height="15" fill="rgb(207,160,47)"/><text x="2.2169%" y="399.50"></text></g><g><title>operator new (60 samples, 0.57%)</title><rect x="2.6288%" y="389" width="0.5674%" height="15" fill="rgb(228,23,34)"/><text x="2.8788%" y="399.50"></text></g><g><title>recursive_directory_entries (31 samples, 0.29%)</title><rect x="3.1962%" y="389" width="0.2931%" height="15" fill="rgb(218,30,26)"/><text x="3.4462%" y="399.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::append (51 samples, 0.48%)</title><rect x="3.4894%" y="389" width="0.4823%" height="15" fill="rgb(220,122,19)"/><text x="3.7394%" y="399.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::basic_string (30 samples, 0.28%)</title><rect x="3.9716%" y="389" width="0.2837%" height="15" fill="rgb(250,228,42)"/><text x="4.2216%" y="399.50"></text></g><g><title>[[heap]] (466 samples, 4.41%)</title><rect x="0.0000%" y="405" width="4.4066%" height="15" fill="rgb(240,193,28)"/><text x="0.2500%" y="415.50">[[hea..</text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::iterator::operator++ (15 samples, 0.14%)</title><rect x="4.6903%" y="389" width="0.1418%" height="15" fill="rgb(216,20,37)"/><text x="4.9403%" y="399.50"></text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::pull (51 samples, 0.48%)</title><rect x="4.8322%" y="389" width="0.4823%" height="15" fill="rgb(206,188,39)"/><text x="5.0822%" y="399.50"></text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::resume (43 samples, 0.41%)</title><rect x="4.9078%" y="373" width="0.4066%" height="15" fill="rgb(217,207,13)"/><text x="5.1578%" y="383.50"></text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume (43 samples, 0.41%)</title><rect x="4.9078%" y="357" width="0.4066%" height="15" fill="rgb(231,73,38)"/><text x="5.1578%" y="367.50"></text></g><g><title>directory_entries_with_paths (16 samples, 0.15%)</title><rect x="5.3333%" y="389" width="0.1513%" height="15" fill="rgb(225,20,46)"/><text x="5.5833%" y="399.50"></text></g><g><title>cppcoro::detail::generator_iterator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::operator++ (17 samples, 0.16%)</title><rect x="5.9858%" y="373" width="0.1608%" height="15" fill="rgb(210,31,41)"/><text x="6.2358%" y="383.50"></text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume (17 samples, 0.16%)</title><rect x="5.9858%" y="357" width="0.1608%" height="15" fill="rgb(221,200,47)"/><text x="6.2358%" y="367.50"></text></g><g><title>recursive_directory_entries (74 samples, 0.70%)</title><rect x="5.5130%" y="389" width="0.6998%" height="15" fill="rgb(226,26,5)"/><text x="5.7630%" y="399.50"></text></g><g><title>std::__1::__put_character_sequence&lt;char, std::__1::char_traits&lt;char&gt; &gt; (47 samples, 0.44%)</title><rect x="6.2128%" y="389" width="0.4444%" height="15" fill="rgb(249,33,26)"/><text x="6.4628%" y="399.50"></text></g><g><title>[[stack]] (250 samples, 2.36%)</title><rect x="4.4066%" y="405" width="2.3641%" height="15" fill="rgb(235,183,28)"/><text x="4.6566%" y="415.50">[[..</text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::iterator::operator++ (13 samples, 0.12%)</title><rect x="6.8369%" y="389" width="0.1229%" height="15" fill="rgb(221,5,38)"/><text x="7.0869%" y="399.50"></text></g><g><title>directory_entries_with_paths (18 samples, 0.17%)</title><rect x="6.9598%" y="389" width="0.1702%" height="15" fill="rgb(247,18,42)"/><text x="7.2098%" y="399.50"></text></g><g><title>recursive_directory_entries (11 samples, 0.10%)</title><rect x="7.1300%" y="389" width="0.1040%" height="15" fill="rgb(241,131,45)"/><text x="7.3800%" y="399.50"></text></g><g><title>[anon] (57 samples, 0.54%)</title><rect x="6.7707%" y="405" width="0.5390%" height="15" fill="rgb(249,31,29)"/><text x="7.0207%" y="415.50"></text></g><g><title>[libc++.so.1.0] (16 samples, 0.15%)</title><rect x="7.3097%" y="405" width="0.1513%" height="15" fill="rgb(225,111,53)"/><text x="7.5597%" y="415.50"></text></g><g><title>_IO_new_file_xsputn (79 samples, 0.75%)</title><rect x="7.4610%" y="389" width="0.7470%" height="15" fill="rgb(238,160,17)"/><text x="7.7110%" y="399.50"></text></g><g><title>[libc-2.33.so] (81 samples, 0.77%)</title><rect x="7.4610%" y="405" width="0.7660%" height="15" fill="rgb(214,148,48)"/><text x="7.7110%" y="415.50"></text></g><g><title>[libc++.so.1.0] (63 samples, 0.60%)</title><rect x="8.2270%" y="389" width="0.5957%" height="15" fill="rgb(232,36,49)"/><text x="8.4770%" y="399.50"></text></g><g><title>_IO_new_file_xsputn (50 samples, 0.47%)</title><rect x="8.8511%" y="389" width="0.4728%" height="15" fill="rgb(209,103,24)"/><text x="9.1011%" y="399.50"></text></g><g><title>__GI__IO_fwrite (110 samples, 1.04%)</title><rect x="9.3239%" y="389" width="1.0402%" height="15" fill="rgb(229,88,8)"/><text x="9.5739%" y="399.50"></text></g><g><title>__GI___libc_free (48 samples, 0.45%)</title><rect x="10.4208%" y="389" width="0.4539%" height="15" fill="rgb(213,181,19)"/><text x="10.6708%" y="399.50"></text></g><g><title>__GI___libc_malloc (47 samples, 0.44%)</title><rect x="10.8747%" y="389" width="0.4444%" height="15" fill="rgb(254,191,54)"/><text x="11.1247%" y="399.50"></text></g><g><title>__GI___open64_nocancel (15 samples, 0.14%)</title><rect x="11.3286%" y="389" width="0.1418%" height="15" fill="rgb(241,83,37)"/><text x="11.5786%" y="399.50"></text></g><g><title>__fstatat64 (13 samples, 0.12%)</title><rect x="11.5177%" y="389" width="0.1229%" height="15" fill="rgb(233,36,39)"/><text x="11.7677%" y="399.50"></text></g><g><title>_int_free (57 samples, 0.54%)</title><rect x="11.7636%" y="389" width="0.5390%" height="15" fill="rgb(226,3,54)"/><text x="12.0136%" y="399.50"></text></g><g><title>directory_entries (13 samples, 0.12%)</title><rect x="12.4255%" y="389" width="0.1229%" height="15" fill="rgb(245,192,40)"/><text x="12.6755%" y="399.50"></text></g><g><title>cppcoro::detail::generator_iterator&lt;dirent&gt;::operator++ (11 samples, 0.10%)</title><rect x="12.8416%" y="373" width="0.1040%" height="15" fill="rgb(238,167,29)"/><text x="13.0916%" y="383.50"></text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume (11 samples, 0.10%)</title><rect x="12.8416%" y="357" width="0.1040%" height="15" fill="rgb(232,182,51)"/><text x="13.0916%" y="367.50"></text></g><g><title>directory_entries_with_paths (62 samples, 0.59%)</title><rect x="12.5485%" y="389" width="0.5863%" height="15" fill="rgb(231,60,39)"/><text x="12.7985%" y="399.50"></text></g><g><title>~pair (12 samples, 0.11%)</title><rect x="13.0213%" y="373" width="0.1135%" height="15" fill="rgb(208,69,12)"/><text x="13.2713%" y="383.50"></text></g><g><title>~basic_string (12 samples, 0.11%)</title><rect x="13.0213%" y="357" width="0.1135%" height="15" fill="rgb(235,93,37)"/><text x="13.2713%" y="367.50"></text></g><g><title>std::__1::allocator_traits&lt;std::__1::allocator&lt;char&gt; &gt;::deallocate (12 samples, 0.11%)</title><rect x="13.0213%" y="341" width="0.1135%" height="15" fill="rgb(213,116,39)"/><text x="13.2713%" y="351.50"></text></g><g><title>std::__1::allocator&lt;char&gt;::deallocate (12 samples, 0.11%)</title><rect x="13.0213%" y="325" width="0.1135%" height="15" fill="rgb(222,207,29)"/><text x="13.2713%" y="335.50"></text></g><g><title>std::__1::__libcpp_deallocate (12 samples, 0.11%)</title><rect x="13.0213%" y="309" width="0.1135%" height="15" fill="rgb(206,96,30)"/><text x="13.2713%" y="319.50"></text></g><g><title>std::__1::__do_deallocate_handle_size&lt;&gt; (12 samples, 0.11%)</title><rect x="13.0213%" y="293" width="0.1135%" height="15" fill="rgb(218,138,4)"/><text x="13.2713%" y="303.50"></text></g><g><title>std::__1::__libcpp_operator_delete&lt;void*&gt; (12 samples, 0.11%)</title><rect x="13.0213%" y="277" width="0.1135%" height="15" fill="rgb(250,191,14)"/><text x="13.2713%" y="287.50"></text></g><g><title>main (12 samples, 0.11%)</title><rect x="13.1348%" y="389" width="0.1135%" height="15" fill="rgb(239,60,40)"/><text x="13.3848%" y="399.50"></text></g><g><title>new_do_write (11 samples, 0.10%)</title><rect x="13.2482%" y="389" width="0.1040%" height="15" fill="rgb(206,27,48)"/><text x="13.4982%" y="399.50"></text></g><g><title>operator new (50 samples, 0.47%)</title><rect x="13.3901%" y="389" width="0.4728%" height="15" fill="rgb(225,35,8)"/><text x="13.6401%" y="399.50"></text></g><g><title>std::__1::__pad_and_output&lt;char, std::__1::char_traits&lt;char&gt; &gt; (192 samples, 1.82%)</title><rect x="13.8723%" y="389" width="1.8156%" height="15" fill="rgb(250,213,24)"/><text x="14.1223%" y="399.50">s..</text></g><g><title>std::__1::basic_streambuf&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sputn (83 samples, 0.78%)</title><rect x="14.9031%" y="373" width="0.7849%" height="15" fill="rgb(247,123,22)"/><text x="15.1531%" y="383.50"></text></g><g><title>std::__1::__put_character_sequence&lt;char, std::__1::char_traits&lt;char&gt; &gt; (87 samples, 0.82%)</title><rect x="15.6879%" y="389" width="0.8227%" height="15" fill="rgb(231,138,38)"/><text x="15.9379%" y="399.50"></text></g><g><title>std::__1::basic_ostream&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sentry::sentry (24 samples, 0.23%)</title><rect x="16.5106%" y="389" width="0.2270%" height="15" fill="rgb(231,145,46)"/><text x="16.7606%" y="399.50"></text></g><g><title>std::__1::basic_ostream&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sentry::~sentry (34 samples, 0.32%)</title><rect x="16.7376%" y="389" width="0.3215%" height="15" fill="rgb(251,118,11)"/><text x="16.9876%" y="399.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::__grow_by_and_replace (59 samples, 0.56%)</title><rect x="17.1442%" y="389" width="0.5579%" height="15" fill="rgb(217,147,25)"/><text x="17.3942%" y="399.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::append (27 samples, 0.26%)</title><rect x="17.7021%" y="389" width="0.2553%" height="15" fill="rgb(247,81,37)"/><text x="17.9521%" y="399.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::basic_string (15 samples, 0.14%)</title><rect x="17.9574%" y="389" width="0.1418%" height="15" fill="rgb(209,12,38)"/><text x="18.2074%" y="399.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::push_back (20 samples, 0.19%)</title><rect x="18.0993%" y="389" width="0.1891%" height="15" fill="rgb(227,1,9)"/><text x="18.3493%" y="399.50"></text></g><g><title>[unknown] (1,066 samples, 10.08%)</title><rect x="8.2270%" y="405" width="10.0804%" height="15" fill="rgb(248,47,43)"/><text x="8.4770%" y="415.50">[unknown]</text></g><g><title>__GI__IO_fwrite (40 samples, 0.38%)</title><rect x="18.3452%" y="405" width="0.3783%" height="15" fill="rgb(221,10,30)"/><text x="18.5952%" y="415.50"></text></g><g><title>__GI___libc_free (22 samples, 0.21%)</title><rect x="18.7896%" y="405" width="0.2080%" height="15" fill="rgb(210,229,1)"/><text x="19.0396%" y="415.50"></text></g><g><title>__readdir64 (27 samples, 0.26%)</title><rect x="18.9976%" y="405" width="0.2553%" height="15" fill="rgb(222,148,37)"/><text x="19.2476%" y="415.50"></text></g><g><title>_int_free (48 samples, 0.45%)</title><rect x="19.3191%" y="405" width="0.4539%" height="15" fill="rgb(234,67,33)"/><text x="19.5691%" y="415.50"></text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::iterator::operator* (32 samples, 0.30%)</title><rect x="20.3783%" y="357" width="0.3026%" height="15" fill="rgb(247,98,35)"/><text x="20.6283%" y="367.50"></text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::value (32 samples, 0.30%)</title><rect x="20.3783%" y="341" width="0.3026%" height="15" fill="rgb(247,138,52)"/><text x="20.6283%" y="351.50"></text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::is_complete (15 samples, 0.14%)</title><rect x="21.2955%" y="341" width="0.1418%" height="15" fill="rgb(213,79,30)"/><text x="21.5455%" y="351.50"></text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::done (15 samples, 0.14%)</title><rect x="21.2955%" y="325" width="0.1418%" height="15" fill="rgb(246,177,23)"/><text x="21.5455%" y="335.50"></text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::is_complete (30 samples, 0.28%)</title><rect x="21.9953%" y="325" width="0.2837%" height="15" fill="rgb(230,62,27)"/><text x="22.2453%" y="335.50"></text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::done (30 samples, 0.28%)</title><rect x="21.9953%" y="309" width="0.2837%" height="15" fill="rgb(216,154,8)"/><text x="22.2453%" y="319.50"></text></g><g><title>await_resume (20 samples, 0.19%)</title><rect x="23.1206%" y="277" width="0.1891%" height="15" fill="rgb(244,35,45)"/><text x="23.3706%" y="287.50"></text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::throw_if_exception (20 samples, 0.19%)</title><rect x="23.1206%" y="261" width="0.1891%" height="15" fill="rgb(251,115,12)"/><text x="23.3706%" y="271.50"></text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::done (11 samples, 0.10%)</title><rect x="23.4137%" y="261" width="0.1040%" height="15" fill="rgb(240,54,50)"/><text x="23.6637%" y="271.50"></text></g><g><title>operator new (268 samples, 2.53%)</title><rect x="24.3215%" y="133" width="2.5343%" height="15" fill="rgb(233,84,52)"/><text x="24.5715%" y="143.50">op..</text></g><g><title>__GI___libc_malloc (243 samples, 2.30%)</title><rect x="24.5579%" y="117" width="2.2979%" height="15" fill="rgb(207,117,47)"/><text x="24.8079%" y="127.50">_..</text></g><g><title>std::__1::allocator_traits&lt;std::__1::allocator&lt;char&gt; &gt;::allocate (284 samples, 2.69%)</title><rect x="24.2648%" y="197" width="2.6856%" height="15" fill="rgb(249,43,39)"/><text x="24.5148%" y="207.50">st..</text></g><g><title>std::__1::allocator&lt;char&gt;::allocate (284 samples, 2.69%)</title><rect x="24.2648%" y="181" width="2.6856%" height="15" fill="rgb(209,38,44)"/><text x="24.5148%" y="191.50">st..</text></g><g><title>std::__1::__libcpp_allocate (284 samples, 2.69%)</title><rect x="24.2648%" y="165" width="2.6856%" height="15" fill="rgb(236,212,23)"/><text x="24.5148%" y="175.50">st..</text></g><g><title>std::__1::__libcpp_operator_new&lt;unsigned long&gt; (284 samples, 2.69%)</title><rect x="24.2648%" y="149" width="2.6856%" height="15" fill="rgb(242,79,21)"/><text x="24.5148%" y="159.50">st..</text></g><g><title>__memmove_avx_unaligned_erms (102 samples, 0.96%)</title><rect x="27.2151%" y="181" width="0.9645%" height="15" fill="rgb(211,96,35)"/><text x="27.4651%" y="191.50"></text></g><g><title>basic_string&lt;std::string_view, void&gt; (433 samples, 4.09%)</title><rect x="24.1986%" y="229" width="4.0946%" height="15" fill="rgb(253,215,40)"/><text x="24.4486%" y="239.50">basi..</text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::__init (433 samples, 4.09%)</title><rect x="24.1986%" y="213" width="4.0946%" height="15" fill="rgb(211,81,21)"/><text x="24.4486%" y="223.50">std:..</text></g><g><title>std::__1::char_traits&lt;char&gt;::copy (125 samples, 1.18%)</title><rect x="27.1111%" y="197" width="1.1820%" height="15" fill="rgb(208,190,38)"/><text x="27.3611%" y="207.50"></text></g><g><title>memcpy@plt (12 samples, 0.11%)</title><rect x="28.1797%" y="181" width="0.1135%" height="15" fill="rgb(235,213,38)"/><text x="28.4297%" y="191.50"></text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::done (29 samples, 0.27%)</title><rect x="28.4350%" y="213" width="0.2742%" height="15" fill="rgb(237,122,38)"/><text x="28.6850%" y="223.50"></text></g><g><title>__GI___close_nocancel (95 samples, 0.90%)</title><rect x="29.5319%" y="181" width="0.8983%" height="15" fill="rgb(244,218,35)"/><text x="29.7819%" y="191.50"></text></g><g><title>[libc-2.33.so] (40 samples, 0.38%)</title><rect x="30.4965%" y="165" width="0.3783%" height="15" fill="rgb(240,68,47)"/><text x="30.7465%" y="175.50"></text></g><g><title>__closedir (234 samples, 2.21%)</title><rect x="30.4303%" y="181" width="2.2128%" height="15" fill="rgb(210,16,53)"/><text x="30.6803%" y="191.50">_..</text></g><g><title>__GI___libc_free (187 samples, 1.77%)</title><rect x="30.8747%" y="165" width="1.7683%" height="15" fill="rgb(235,124,12)"/><text x="31.1247%" y="175.50"></text></g><g><title>_int_free (142 samples, 1.34%)</title><rect x="31.3002%" y="149" width="1.3428%" height="15" fill="rgb(224,169,11)"/><text x="31.5502%" y="159.50"></text></g><g><title>systrim.constprop.0 (36 samples, 0.34%)</title><rect x="32.3026%" y="133" width="0.3404%" height="15" fill="rgb(250,166,2)"/><text x="32.5526%" y="143.50"></text></g><g><title>__GI___default_morecore (16 samples, 0.15%)</title><rect x="32.4917%" y="117" width="0.1513%" height="15" fill="rgb(242,216,29)"/><text x="32.7417%" y="127.50"></text></g><g><title>__GI___sbrk (15 samples, 0.14%)</title><rect x="32.5012%" y="101" width="0.1418%" height="15" fill="rgb(230,116,27)"/><text x="32.7512%" y="111.50"></text></g><g><title>__readdir64 (415 samples, 3.92%)</title><rect x="32.6430%" y="181" width="3.9243%" height="15" fill="rgb(228,99,48)"/><text x="32.8930%" y="191.50">__re..</text></g><g><title>__GI___getdents64 (96 samples, 0.91%)</title><rect x="35.6596%" y="165" width="0.9078%" height="15" fill="rgb(253,11,6)"/><text x="35.9096%" y="175.50"></text></g><g><title>__strlen_avx2 (316 samples, 2.99%)</title><rect x="36.8132%" y="117" width="2.9882%" height="15" fill="rgb(247,143,39)"/><text x="37.0632%" y="127.50">__s..</text></g><g><title>basic_string_view (331 samples, 3.13%)</title><rect x="36.7849%" y="165" width="3.1300%" height="15" fill="rgb(236,97,10)"/><text x="37.0349%" y="175.50">bas..</text></g><g><title>std::__1::__char_traits_length_checked&lt;std::__1::char_traits&lt;char&gt; &gt; (331 samples, 3.13%)</title><rect x="36.7849%" y="149" width="3.1300%" height="15" fill="rgb(233,208,19)"/><text x="37.0349%" y="159.50">std..</text></g><g><title>std::__1::char_traits&lt;char&gt;::length (331 samples, 3.13%)</title><rect x="36.7849%" y="133" width="3.1300%" height="15" fill="rgb(216,164,2)"/><text x="37.0349%" y="143.50">std..</text></g><g><title>strlen@plt (12 samples, 0.11%)</title><rect x="39.8014%" y="117" width="0.1135%" height="15" fill="rgb(220,129,5)"/><text x="40.0514%" y="127.50"></text></g><g><title>is_special (382 samples, 3.61%)</title><rect x="36.7281%" y="181" width="3.6123%" height="15" fill="rgb(242,17,10)"/><text x="36.9781%" y="191.50">is_s..</text></g><g><title>std::__1::operator==&lt;char, std::__1::char_traits&lt;char&gt; &gt; (45 samples, 0.43%)</title><rect x="39.9149%" y="165" width="0.4255%" height="15" fill="rgb(242,107,0)"/><text x="40.1649%" y="175.50"></text></g><g><title>std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt;::compare (33 samples, 0.31%)</title><rect x="40.0284%" y="149" width="0.3121%" height="15" fill="rgb(251,28,31)"/><text x="40.2784%" y="159.50"></text></g><g><title>cppcoro::detail::generator_iterator&lt;dirent&gt;::operator++ (1,292 samples, 12.22%)</title><rect x="28.2931%" y="229" width="12.2175%" height="15" fill="rgb(233,223,10)"/><text x="28.5431%" y="239.50">cppcoro::detail::g..</text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume (1,248 samples, 11.80%)</title><rect x="28.7092%" y="213" width="11.8014%" height="15" fill="rgb(215,21,27)"/><text x="28.9592%" y="223.50">std::experimental:..</text></g><g><title>directory_entries (1,248 samples, 11.80%)</title><rect x="28.7092%" y="197" width="11.8014%" height="15" fill="rgb(232,23,21)"/><text x="28.9592%" y="207.50">directory_entries</text></g><g><title>readdir@plt (18 samples, 0.17%)</title><rect x="40.3404%" y="181" width="0.1702%" height="15" fill="rgb(244,5,23)"/><text x="40.5904%" y="191.50"></text></g><g><title>__memmove_avx_unaligned_erms (189 samples, 1.79%)</title><rect x="40.6714%" y="213" width="1.7872%" height="15" fill="rgb(226,81,46)"/><text x="40.9214%" y="223.50">_..</text></g><g><title>memcpy@plt (13 samples, 0.12%)</title><rect x="42.4586%" y="213" width="0.1229%" height="15" fill="rgb(247,70,30)"/><text x="42.7086%" y="223.50"></text></g><g><title>pair&lt;dirent, std::string, false&gt; (221 samples, 2.09%)</title><rect x="40.5106%" y="229" width="2.0898%" height="15" fill="rgb(212,68,19)"/><text x="40.7606%" y="239.50">p..</text></g><g><title>__memmove_avx_unaligned_erms (231 samples, 2.18%)</title><rect x="42.7896%" y="197" width="2.1844%" height="15" fill="rgb(240,187,13)"/><text x="43.0396%" y="207.50">_..</text></g><g><title>_init (11 samples, 0.10%)</title><rect x="44.9740%" y="197" width="0.1040%" height="15" fill="rgb(223,113,26)"/><text x="45.2240%" y="207.50"></text></g><g><title>__memmove_avx_unaligned_erms (124 samples, 1.17%)</title><rect x="45.6076%" y="181" width="1.1726%" height="15" fill="rgb(206,192,2)"/><text x="45.8576%" y="191.50"></text></g><g><title>std::__1::make_pair&lt;dirent const&amp;, std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;&amp;&gt; (586 samples, 5.54%)</title><rect x="42.6005%" y="229" width="5.5414%" height="15" fill="rgb(241,108,4)"/><text x="42.8505%" y="239.50">std::__..</text></g><g><title>pair&lt;const dirent &amp;, std::string &amp;, false&gt; (586 samples, 5.54%)</title><rect x="42.6005%" y="213" width="5.5414%" height="15" fill="rgb(247,173,49)"/><text x="42.8505%" y="223.50">pair&lt;co..</text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::basic_string (319 samples, 3.02%)</title><rect x="45.1253%" y="197" width="3.0165%" height="15" fill="rgb(224,114,35)"/><text x="45.3753%" y="207.50">std..</text></g><g><title>operator new (144 samples, 1.36%)</title><rect x="46.7801%" y="181" width="1.3617%" height="15" fill="rgb(245,159,27)"/><text x="47.0301%" y="191.50"></text></g><g><title>__GI___libc_malloc (125 samples, 1.18%)</title><rect x="46.9598%" y="165" width="1.1820%" height="15" fill="rgb(245,172,44)"/><text x="47.2098%" y="175.50"></text></g><g><title>basic_string (277 samples, 2.62%)</title><rect x="48.1702%" y="213" width="2.6194%" height="15" fill="rgb(236,23,11)"/><text x="48.4202%" y="223.50">ba..</text></g><g><title>__memmove_avx_unaligned_erms (33 samples, 0.31%)</title><rect x="51.6879%" y="197" width="0.3121%" height="15" fill="rgb(205,117,38)"/><text x="51.9379%" y="207.50"></text></g><g><title>__strlen_avx2 (50 samples, 0.47%)</title><rect x="52.0000%" y="197" width="0.4728%" height="15" fill="rgb(237,72,25)"/><text x="52.2500%" y="207.50"></text></g><g><title>__GI___libc_free (139 samples, 1.31%)</title><rect x="53.5225%" y="181" width="1.3144%" height="15" fill="rgb(244,70,9)"/><text x="53.7725%" y="191.50"></text></g><g><title>_int_free (89 samples, 0.84%)</title><rect x="53.9953%" y="165" width="0.8416%" height="15" fill="rgb(217,125,39)"/><text x="54.2453%" y="175.50"></text></g><g><title>__memmove_avx_unaligned_erms (101 samples, 0.96%)</title><rect x="54.8369%" y="181" width="0.9551%" height="15" fill="rgb(235,36,10)"/><text x="55.0869%" y="191.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::append (660 samples, 6.24%)</title><rect x="50.7896%" y="213" width="6.2411%" height="15" fill="rgb(251,123,47)"/><text x="51.0396%" y="223.50">std::__1..</text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::__grow_by_and_replace (482 samples, 4.56%)</title><rect x="52.4728%" y="197" width="4.5579%" height="15" fill="rgb(221,13,13)"/><text x="52.7228%" y="207.50">std::..</text></g><g><title>operator new (121 samples, 1.14%)</title><rect x="55.8865%" y="181" width="1.1442%" height="15" fill="rgb(238,131,9)"/><text x="56.1365%" y="191.50"></text></g><g><title>__GI___libc_malloc (107 samples, 1.01%)</title><rect x="56.0189%" y="165" width="1.0118%" height="15" fill="rgb(211,50,8)"/><text x="56.2689%" y="175.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::append@plt (13 samples, 0.12%)</title><rect x="57.0307%" y="213" width="0.1229%" height="15" fill="rgb(245,182,24)"/><text x="57.2807%" y="223.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::push_back (99 samples, 0.94%)</title><rect x="57.1537%" y="213" width="0.9362%" height="15" fill="rgb(242,14,37)"/><text x="57.4037%" y="223.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::__grow_by (32 samples, 0.30%)</title><rect x="57.7872%" y="197" width="0.3026%" height="15" fill="rgb(246,228,12)"/><text x="58.0372%" y="207.50"></text></g><g><title>operator new (12 samples, 0.11%)</title><rect x="57.9764%" y="181" width="0.1135%" height="15" fill="rgb(213,55,15)"/><text x="58.2264%" y="191.50"></text></g><g><title>std::__1::operator+&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; (1,065 samples, 10.07%)</title><rect x="48.1418%" y="229" width="10.0709%" height="15" fill="rgb(209,9,3)"/><text x="48.3918%" y="239.50">std::__1::opera..</text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::push_back@plt (13 samples, 0.12%)</title><rect x="58.0898%" y="213" width="0.1229%" height="15" fill="rgb(230,59,30)"/><text x="58.3398%" y="223.50"></text></g><g><title>__GI___libc_free (267 samples, 2.52%)</title><rect x="58.2884%" y="133" width="2.5248%" height="15" fill="rgb(209,121,21)"/><text x="58.5384%" y="143.50">__..</text></g><g><title>_int_free (194 samples, 1.83%)</title><rect x="58.9787%" y="117" width="1.8345%" height="15" fill="rgb(220,109,13)"/><text x="59.2287%" y="127.50">_..</text></g><g><title>operator delete (11 samples, 0.10%)</title><rect x="60.8132%" y="133" width="0.1040%" height="15" fill="rgb(232,18,1)"/><text x="61.0632%" y="143.50"></text></g><g><title>std::__1::allocator_traits&lt;std::__1::allocator&lt;char&gt; &gt;::deallocate (285 samples, 2.70%)</title><rect x="58.2884%" y="213" width="2.6950%" height="15" fill="rgb(215,41,42)"/><text x="58.5384%" y="223.50">st..</text></g><g><title>std::__1::allocator&lt;char&gt;::deallocate (285 samples, 2.70%)</title><rect x="58.2884%" y="197" width="2.6950%" height="15" fill="rgb(224,123,36)"/><text x="58.5384%" y="207.50">st..</text></g><g><title>std::__1::__libcpp_deallocate (285 samples, 2.70%)</title><rect x="58.2884%" y="181" width="2.6950%" height="15" fill="rgb(240,125,3)"/><text x="58.5384%" y="191.50">st..</text></g><g><title>std::__1::__do_deallocate_handle_size&lt;&gt; (285 samples, 2.70%)</title><rect x="58.2884%" y="165" width="2.6950%" height="15" fill="rgb(205,98,50)"/><text x="58.5384%" y="175.50">st..</text></g><g><title>std::__1::__libcpp_operator_delete&lt;void*&gt; (285 samples, 2.70%)</title><rect x="58.2884%" y="149" width="2.6950%" height="15" fill="rgb(205,185,37)"/><text x="58.5384%" y="159.50">st..</text></g><g><title>~basic_string (320 samples, 3.03%)</title><rect x="58.2128%" y="229" width="3.0260%" height="15" fill="rgb(238,207,15)"/><text x="58.4628%" y="239.50">~ba..</text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::__is_long (20 samples, 0.19%)</title><rect x="61.0496%" y="213" width="0.1891%" height="15" fill="rgb(213,199,42)"/><text x="61.2996%" y="223.50"></text></g><g><title>std::exception_ptr::~exception_ptr (11 samples, 0.10%)</title><rect x="61.2388%" y="165" width="0.1040%" height="15" fill="rgb(235,201,11)"/><text x="61.4888%" y="175.50"></text></g><g><title>~generator (14 samples, 0.13%)</title><rect x="61.2388%" y="229" width="0.1324%" height="15" fill="rgb(207,46,11)"/><text x="61.4888%" y="239.50"></text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::destroy (14 samples, 0.13%)</title><rect x="61.2388%" y="213" width="0.1324%" height="15" fill="rgb(241,35,35)"/><text x="61.4888%" y="223.50"></text></g><g><title>directory_entries (14 samples, 0.13%)</title><rect x="61.2388%" y="197" width="0.1324%" height="15" fill="rgb(243,32,47)"/><text x="61.4888%" y="207.50"></text></g><g><title>~generator_promise (14 samples, 0.13%)</title><rect x="61.2388%" y="181" width="0.1324%" height="15" fill="rgb(247,202,23)"/><text x="61.4888%" y="191.50"></text></g><g><title>__GI___libc_free (248 samples, 2.35%)</title><rect x="61.3712%" y="117" width="2.3452%" height="15" fill="rgb(219,102,11)"/><text x="61.6212%" y="127.50">_..</text></g><g><title>_int_free (174 samples, 1.65%)</title><rect x="62.0709%" y="101" width="1.6454%" height="15" fill="rgb(243,110,44)"/><text x="62.3209%" y="111.50"></text></g><g><title>operator delete (15 samples, 0.14%)</title><rect x="63.7163%" y="117" width="0.1418%" height="15" fill="rgb(222,74,54)"/><text x="63.9663%" y="127.50"></text></g><g><title>std::__1::allocator_traits&lt;std::__1::allocator&lt;char&gt; &gt;::deallocate (275 samples, 2.60%)</title><rect x="61.3712%" y="197" width="2.6005%" height="15" fill="rgb(216,99,12)"/><text x="61.6212%" y="207.50">st..</text></g><g><title>std::__1::allocator&lt;char&gt;::deallocate (275 samples, 2.60%)</title><rect x="61.3712%" y="181" width="2.6005%" height="15" fill="rgb(226,22,26)"/><text x="61.6212%" y="191.50">st..</text></g><g><title>std::__1::__libcpp_deallocate (275 samples, 2.60%)</title><rect x="61.3712%" y="165" width="2.6005%" height="15" fill="rgb(217,163,10)"/><text x="61.6212%" y="175.50">st..</text></g><g><title>std::__1::__do_deallocate_handle_size&lt;&gt; (275 samples, 2.60%)</title><rect x="61.3712%" y="149" width="2.6005%" height="15" fill="rgb(213,25,53)"/><text x="61.6212%" y="159.50">st..</text></g><g><title>std::__1::__libcpp_operator_delete&lt;void*&gt; (275 samples, 2.60%)</title><rect x="61.3712%" y="133" width="2.6005%" height="15" fill="rgb(252,105,26)"/><text x="61.6212%" y="143.50">st..</text></g><g><title>operator delete@plt (12 samples, 0.11%)</title><rect x="63.8582%" y="117" width="0.1135%" height="15" fill="rgb(220,39,43)"/><text x="64.1082%" y="127.50"></text></g><g><title>cppcoro::detail::generator_iterator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::operator++ (4,306 samples, 40.72%)</title><rect x="23.3097%" y="277" width="40.7187%" height="15" fill="rgb(229,68,48)"/><text x="23.5597%" y="287.50">cppcoro::detail::generator_iterator&lt;std::__1::pair&lt;dirent, std::__1..</text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume (4,284 samples, 40.51%)</title><rect x="23.5177%" y="261" width="40.5106%" height="15" fill="rgb(252,8,32)"/><text x="23.7677%" y="271.50">std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume</text></g><g><title>directory_entries_with_paths (4,275 samples, 40.43%)</title><rect x="23.6028%" y="245" width="40.4255%" height="15" fill="rgb(223,20,43)"/><text x="23.8528%" y="255.50">directory_entries_with_paths</text></g><g><title>~pair (281 samples, 2.66%)</title><rect x="61.3712%" y="229" width="2.6572%" height="15" fill="rgb(229,81,49)"/><text x="61.6212%" y="239.50">~p..</text></g><g><title>~basic_string (281 samples, 2.66%)</title><rect x="61.3712%" y="213" width="2.6572%" height="15" fill="rgb(236,28,36)"/><text x="61.6212%" y="223.50">~b..</text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::is_complete (20 samples, 0.19%)</title><rect x="64.2459%" y="245" width="0.1891%" height="15" fill="rgb(249,185,26)"/><text x="64.4959%" y="255.50"></text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::done (14 samples, 0.13%)</title><rect x="64.3026%" y="229" width="0.1324%" height="15" fill="rgb(249,174,33)"/><text x="64.5526%" y="239.50"></text></g><g><title>operator new (121 samples, 1.14%)</title><rect x="64.8227%" y="53" width="1.1442%" height="15" fill="rgb(233,201,37)"/><text x="65.0727%" y="63.50"></text></g><g><title>__GI___libc_malloc (116 samples, 1.10%)</title><rect x="64.8700%" y="37" width="1.0969%" height="15" fill="rgb(221,78,26)"/><text x="65.1200%" y="47.50"></text></g><g><title>std::__1::allocator_traits&lt;std::__1::allocator&lt;char&gt; &gt;::allocate (136 samples, 1.29%)</title><rect x="64.8227%" y="117" width="1.2861%" height="15" fill="rgb(250,127,30)"/><text x="65.0727%" y="127.50"></text></g><g><title>std::__1::allocator&lt;char&gt;::allocate (136 samples, 1.29%)</title><rect x="64.8227%" y="101" width="1.2861%" height="15" fill="rgb(230,49,44)"/><text x="65.0727%" y="111.50"></text></g><g><title>std::__1::__libcpp_allocate (136 samples, 1.29%)</title><rect x="64.8227%" y="85" width="1.2861%" height="15" fill="rgb(229,67,23)"/><text x="65.0727%" y="95.50"></text></g><g><title>std::__1::__libcpp_operator_new&lt;unsigned long&gt; (136 samples, 1.29%)</title><rect x="64.8227%" y="69" width="1.2861%" height="15" fill="rgb(249,83,47)"/><text x="65.0727%" y="79.50"></text></g><g><title>operator new@plt (15 samples, 0.14%)</title><rect x="65.9669%" y="53" width="0.1418%" height="15" fill="rgb(215,43,3)"/><text x="66.2169%" y="63.50"></text></g><g><title>__memmove_avx_unaligned_erms (30 samples, 0.28%)</title><rect x="66.1466%" y="101" width="0.2837%" height="15" fill="rgb(238,154,13)"/><text x="66.3966%" y="111.50"></text></g><g><title>basic_string&lt;std::string_view, void&gt; (179 samples, 1.69%)</title><rect x="64.8132%" y="149" width="1.6927%" height="15" fill="rgb(219,56,2)"/><text x="65.0632%" y="159.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::__init (179 samples, 1.69%)</title><rect x="64.8132%" y="133" width="1.6927%" height="15" fill="rgb(233,0,4)"/><text x="65.0632%" y="143.50"></text></g><g><title>std::__1::char_traits&lt;char&gt;::copy (40 samples, 0.38%)</title><rect x="66.1277%" y="117" width="0.3783%" height="15" fill="rgb(235,30,7)"/><text x="66.3777%" y="127.50"></text></g><g><title>__opendir (136 samples, 1.29%)</title><rect x="66.9409%" y="101" width="1.2861%" height="15" fill="rgb(250,79,13)"/><text x="67.1909%" y="111.50"></text></g><g><title>__GI___open64_nocancel (130 samples, 1.23%)</title><rect x="66.9976%" y="85" width="1.2293%" height="15" fill="rgb(211,146,34)"/><text x="67.2476%" y="95.50"></text></g><g><title>__readdir64 (183 samples, 1.73%)</title><rect x="68.2270%" y="101" width="1.7305%" height="15" fill="rgb(228,22,38)"/><text x="68.4770%" y="111.50"></text></g><g><title>__GI___getdents64 (113 samples, 1.07%)</title><rect x="68.8889%" y="85" width="1.0686%" height="15" fill="rgb(235,168,5)"/><text x="69.1389%" y="95.50"></text></g><g><title>__strlen_avx2 (36 samples, 0.34%)</title><rect x="70.0898%" y="37" width="0.3404%" height="15" fill="rgb(221,155,16)"/><text x="70.3398%" y="47.50"></text></g><g><title>basic_string_view (47 samples, 0.44%)</title><rect x="70.0520%" y="85" width="0.4444%" height="15" fill="rgb(215,215,53)"/><text x="70.3020%" y="95.50"></text></g><g><title>std::__1::__char_traits_length_checked&lt;std::__1::char_traits&lt;char&gt; &gt; (47 samples, 0.44%)</title><rect x="70.0520%" y="69" width="0.4444%" height="15" fill="rgb(223,4,10)"/><text x="70.3020%" y="79.50"></text></g><g><title>std::__1::char_traits&lt;char&gt;::length (47 samples, 0.44%)</title><rect x="70.0520%" y="53" width="0.4444%" height="15" fill="rgb(234,103,6)"/><text x="70.3020%" y="63.50"></text></g><g><title>is_special (54 samples, 0.51%)</title><rect x="70.0520%" y="101" width="0.5106%" height="15" fill="rgb(227,97,0)"/><text x="70.3020%" y="111.50"></text></g><g><title>__alloc_dir (227 samples, 2.15%)</title><rect x="70.7329%" y="85" width="2.1466%" height="15" fill="rgb(234,150,53)"/><text x="70.9829%" y="95.50">_..</text></g><g><title>__GI___libc_malloc (200 samples, 1.89%)</title><rect x="70.9882%" y="69" width="1.8913%" height="15" fill="rgb(228,201,54)"/><text x="71.2382%" y="79.50">_..</text></g><g><title>_int_malloc (154 samples, 1.46%)</title><rect x="71.4232%" y="53" width="1.4563%" height="15" fill="rgb(222,22,37)"/><text x="71.6732%" y="63.50"></text></g><g><title>sysmalloc (35 samples, 0.33%)</title><rect x="72.5485%" y="37" width="0.3310%" height="15" fill="rgb(237,53,32)"/><text x="72.7985%" y="47.50"></text></g><g><title>opendir_tail (335 samples, 3.17%)</title><rect x="70.5910%" y="101" width="3.1678%" height="15" fill="rgb(233,25,53)"/><text x="70.8410%" y="111.50">ope..</text></g><g><title>__fstatat64 (93 samples, 0.88%)</title><rect x="72.8794%" y="85" width="0.8794%" height="15" fill="rgb(210,40,34)"/><text x="73.1294%" y="95.50"></text></g><g><title>cppcoro::generator&lt;dirent&gt;::begin (781 samples, 7.39%)</title><rect x="66.5059%" y="149" width="7.3853%" height="15" fill="rgb(241,220,44)"/><text x="66.7559%" y="159.50">cppcoro::g..</text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume (772 samples, 7.30%)</title><rect x="66.5910%" y="133" width="7.3002%" height="15" fill="rgb(235,28,35)"/><text x="66.8410%" y="143.50">std::exper..</text></g><g><title>directory_entries (772 samples, 7.30%)</title><rect x="66.5910%" y="117" width="7.3002%" height="15" fill="rgb(210,56,17)"/><text x="66.8410%" y="127.50">directory_..</text></g><g><title>readdir@plt (14 samples, 0.13%)</title><rect x="73.7589%" y="101" width="0.1324%" height="15" fill="rgb(224,130,29)"/><text x="74.0089%" y="111.50"></text></g><g><title>__memmove_avx_unaligned_erms (53 samples, 0.50%)</title><rect x="74.0331%" y="133" width="0.5012%" height="15" fill="rgb(235,212,8)"/><text x="74.2831%" y="143.50"></text></g><g><title>pair&lt;dirent, std::string, false&gt; (64 samples, 0.61%)</title><rect x="73.9574%" y="149" width="0.6052%" height="15" fill="rgb(223,33,50)"/><text x="74.2074%" y="159.50"></text></g><g><title>__memmove_avx_unaligned_erms (59 samples, 0.56%)</title><rect x="74.6005%" y="117" width="0.5579%" height="15" fill="rgb(219,149,13)"/><text x="74.8505%" y="127.50"></text></g><g><title>__memmove_avx_unaligned_erms (36 samples, 0.34%)</title><rect x="75.3191%" y="101" width="0.3404%" height="15" fill="rgb(250,156,29)"/><text x="75.5691%" y="111.50"></text></g><g><title>std::__1::make_pair&lt;dirent const&amp;, std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;&amp;&gt; (173 samples, 1.64%)</title><rect x="74.5626%" y="149" width="1.6359%" height="15" fill="rgb(216,193,19)"/><text x="74.8126%" y="159.50"></text></g><g><title>pair&lt;const dirent &amp;, std::string &amp;, false&gt; (173 samples, 1.64%)</title><rect x="74.5626%" y="133" width="1.6359%" height="15" fill="rgb(216,135,14)"/><text x="74.8126%" y="143.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::basic_string (108 samples, 1.02%)</title><rect x="75.1773%" y="117" width="1.0213%" height="15" fill="rgb(241,47,5)"/><text x="75.4273%" y="127.50"></text></g><g><title>operator new (57 samples, 0.54%)</title><rect x="75.6596%" y="101" width="0.5390%" height="15" fill="rgb(233,42,35)"/><text x="75.9096%" y="111.50"></text></g><g><title>__GI___libc_malloc (51 samples, 0.48%)</title><rect x="75.7163%" y="85" width="0.4823%" height="15" fill="rgb(231,13,6)"/><text x="75.9663%" y="95.50"></text></g><g><title>basic_string (141 samples, 1.33%)</title><rect x="76.2080%" y="133" width="1.3333%" height="15" fill="rgb(207,181,40)"/><text x="76.4580%" y="143.50"></text></g><g><title>__GI___libc_free (27 samples, 0.26%)</title><rect x="78.1182%" y="101" width="0.2553%" height="15" fill="rgb(254,173,49)"/><text x="78.3682%" y="111.50"></text></g><g><title>_int_free (13 samples, 0.12%)</title><rect x="78.2506%" y="85" width="0.1229%" height="15" fill="rgb(221,1,38)"/><text x="78.5006%" y="95.50"></text></g><g><title>__memmove_avx_unaligned_erms (26 samples, 0.25%)</title><rect x="78.3735%" y="101" width="0.2459%" height="15" fill="rgb(206,124,46)"/><text x="78.6235%" y="111.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::append (148 samples, 1.40%)</title><rect x="77.5414%" y="133" width="1.3995%" height="15" fill="rgb(249,21,11)"/><text x="77.7914%" y="143.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::__grow_by_and_replace (114 samples, 1.08%)</title><rect x="77.8629%" y="117" width="1.0780%" height="15" fill="rgb(222,201,40)"/><text x="78.1129%" y="127.50"></text></g><g><title>operator new (30 samples, 0.28%)</title><rect x="78.6572%" y="101" width="0.2837%" height="15" fill="rgb(235,61,29)"/><text x="78.9072%" y="111.50"></text></g><g><title>__GI___libc_malloc (26 samples, 0.25%)</title><rect x="78.6950%" y="85" width="0.2459%" height="15" fill="rgb(219,207,3)"/><text x="78.9450%" y="95.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::push_back (22 samples, 0.21%)</title><rect x="78.9693%" y="133" width="0.2080%" height="15" fill="rgb(222,56,46)"/><text x="79.2193%" y="143.50"></text></g><g><title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::__grow_by (12 samples, 0.11%)</title><rect x="79.0638%" y="117" width="0.1135%" height="15" fill="rgb(239,76,54)"/><text x="79.3138%" y="127.50"></text></g><g><title>std::__1::operator+&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; (322 samples, 3.04%)</title><rect x="76.1986%" y="149" width="3.0449%" height="15" fill="rgb(231,124,27)"/><text x="76.4486%" y="159.50">std..</text></g><g><title>cppcoro::generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::begin (1,568 samples, 14.83%)</title><rect x="64.4917%" y="197" width="14.8274%" height="15" fill="rgb(249,195,6)"/><text x="64.7417%" y="207.50">cppcoro::generator&lt;std:..</text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume (1,560 samples, 14.75%)</title><rect x="64.5674%" y="181" width="14.7518%" height="15" fill="rgb(237,174,47)"/><text x="64.8174%" y="191.50">std::experimental::coro..</text></g><g><title>directory_entries_with_paths (1,559 samples, 14.74%)</title><rect x="64.5768%" y="165" width="14.7423%" height="15" fill="rgb(206,201,31)"/><text x="64.8268%" y="175.50">directory_entries_with..</text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::yield_value (1,651 samples, 15.61%)</title><rect x="64.0284%" y="277" width="15.6123%" height="15" fill="rgb(231,57,52)"/><text x="64.2784%" y="287.50">cppcoro::recursive_gener..</text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::yield_value (1,651 samples, 15.61%)</title><rect x="64.0284%" y="261" width="15.6123%" height="15" fill="rgb(248,177,22)"/><text x="64.2784%" y="271.50">cppcoro::recursive_gener..</text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::resume (1,608 samples, 15.21%)</title><rect x="64.4350%" y="245" width="15.2057%" height="15" fill="rgb(215,211,37)"/><text x="64.6850%" y="255.50">cppcoro::recursive_gene..</text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume (1,608 samples, 15.21%)</title><rect x="64.4350%" y="229" width="15.2057%" height="15" fill="rgb(241,128,51)"/><text x="64.6850%" y="239.50">std::experimental::coro..</text></g><g><title>recursive_directory_entries (1,608 samples, 15.21%)</title><rect x="64.4350%" y="213" width="15.2057%" height="15" fill="rgb(227,165,31)"/><text x="64.6850%" y="223.50">recursive_directory_ent..</text></g><g><title>directory_entries_with_paths (34 samples, 0.32%)</title><rect x="79.3191%" y="197" width="0.3215%" height="15" fill="rgb(228,167,24)"/><text x="79.5691%" y="207.50"></text></g><g><title>directory_entries_with_paths (21 samples, 0.20%)</title><rect x="79.6407%" y="277" width="0.1986%" height="15" fill="rgb(228,143,12)"/><text x="79.8907%" y="287.50"></text></g><g><title>operator new (58 samples, 0.55%)</title><rect x="79.9243%" y="261" width="0.5485%" height="15" fill="rgb(249,149,8)"/><text x="80.1743%" y="271.50"></text></g><g><title>__GI___libc_malloc (53 samples, 0.50%)</title><rect x="79.9716%" y="245" width="0.5012%" height="15" fill="rgb(243,35,44)"/><text x="80.2216%" y="255.50"></text></g><g><title>recursive_directory_entries (72 samples, 0.68%)</title><rect x="79.8392%" y="277" width="0.6809%" height="15" fill="rgb(246,89,9)"/><text x="80.0892%" y="287.50"></text></g><g><title>__GI___libc_free (80 samples, 0.76%)</title><rect x="80.5957%" y="229" width="0.7565%" height="15" fill="rgb(233,213,13)"/><text x="80.8457%" y="239.50"></text></g><g><title>_int_free (53 samples, 0.50%)</title><rect x="80.8511%" y="213" width="0.5012%" height="15" fill="rgb(233,141,41)"/><text x="81.1011%" y="223.50"></text></g><g><title>operator delete (12 samples, 0.11%)</title><rect x="81.3522%" y="229" width="0.1135%" height="15" fill="rgb(239,167,4)"/><text x="81.6022%" y="239.50"></text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::iterator::operator++ (6,442 samples, 60.92%)</title><rect x="20.6809%" y="357" width="60.9173%" height="15" fill="rgb(209,217,16)"/><text x="20.9309%" y="367.50">cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_..</text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::pull (6,362 samples, 60.16%)</title><rect x="21.4374%" y="341" width="60.1608%" height="15" fill="rgb(219,88,35)"/><text x="21.6874%" y="351.50">cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::cha..</text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::resume (6,273 samples, 59.32%)</title><rect x="22.2790%" y="325" width="59.3191%" height="15" fill="rgb(220,193,23)"/><text x="22.5290%" y="335.50">cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::ch..</text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume (6,273 samples, 59.32%)</title><rect x="22.2790%" y="309" width="59.3191%" height="15" fill="rgb(230,90,52)"/><text x="22.5290%" y="319.50">std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::resume</text></g><g><title>recursive_directory_entries (6,273 samples, 59.32%)</title><rect x="22.2790%" y="293" width="59.3191%" height="15" fill="rgb(252,106,19)"/><text x="22.5290%" y="303.50">recursive_directory_entries</text></g><g><title>~recursive_generator (109 samples, 1.03%)</title><rect x="80.5674%" y="277" width="1.0307%" height="15" fill="rgb(206,74,20)"/><text x="80.8174%" y="287.50"></text></g><g><title>cppcoro::recursive_generator&lt;std::__1::pair&lt;dirent, std::__1::basic_string_view&lt;char, std::__1::char_traits&lt;char&gt; &gt; &gt; &gt;::promise_type::destroy (108 samples, 1.02%)</title><rect x="80.5768%" y="261" width="1.0213%" height="15" fill="rgb(230,138,44)"/><text x="80.8268%" y="271.50"></text></g><g><title>std::experimental::coroutines_v1::coroutine_handle&lt;void&gt;::destroy (106 samples, 1.00%)</title><rect x="80.5957%" y="245" width="1.0024%" height="15" fill="rgb(235,182,43)"/><text x="80.8457%" y="255.50"></text></g><g><title>recursive_directory_entries (12 samples, 0.11%)</title><rect x="81.4846%" y="229" width="0.1135%" height="15" fill="rgb(242,16,51)"/><text x="81.7346%" y="239.50"></text></g><g><title>ostreambuf_iterator (26 samples, 0.25%)</title><rect x="82.2695%" y="325" width="0.2459%" height="15" fill="rgb(248,9,4)"/><text x="82.5195%" y="335.50"></text></g><g><title>[libc++.so.1.0] (28 samples, 0.26%)</title><rect x="83.4515%" y="293" width="0.2648%" height="15" fill="rgb(210,31,22)"/><text x="83.7015%" y="303.50"></text></g><g><title>[libc-2.33.so] (14 samples, 0.13%)</title><rect x="86.8463%" y="261" width="0.1324%" height="15" fill="rgb(239,54,39)"/><text x="87.0963%" y="271.50"></text></g><g><title>_IO_new_do_write (27 samples, 0.26%)</title><rect x="86.9787%" y="261" width="0.2553%" height="15" fill="rgb(230,99,41)"/><text x="87.2287%" y="271.50"></text></g><g><title>new_do_write (25 samples, 0.24%)</title><rect x="86.9976%" y="245" width="0.2364%" height="15" fill="rgb(253,106,12)"/><text x="87.2476%" y="255.50"></text></g><g><title>_IO_new_file_write (20 samples, 0.19%)</title><rect x="87.0449%" y="229" width="0.1891%" height="15" fill="rgb(213,46,41)"/><text x="87.2949%" y="239.50"></text></g><g><title>__GI___libc_write (14 samples, 0.13%)</title><rect x="87.1017%" y="213" width="0.1324%" height="15" fill="rgb(215,133,35)"/><text x="87.3517%" y="223.50"></text></g><g><title>__GI__IO_default_xsputn (23 samples, 0.22%)</title><rect x="87.2340%" y="261" width="0.2175%" height="15" fill="rgb(213,28,5)"/><text x="87.4840%" y="271.50"></text></g><g><title>__memmove_avx_unaligned_erms (118 samples, 1.12%)</title><rect x="87.4799%" y="261" width="1.1158%" height="15" fill="rgb(215,77,49)"/><text x="87.7299%" y="271.50"></text></g><g><title>std::__1::basic_streambuf&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sputn (571 samples, 5.40%)</title><rect x="83.3286%" y="309" width="5.3995%" height="15" fill="rgb(248,100,22)"/><text x="83.5786%" y="319.50">std::__..</text></g><g><title>__GI__IO_fwrite (530 samples, 5.01%)</title><rect x="83.7163%" y="293" width="5.0118%" height="15" fill="rgb(208,67,9)"/><text x="83.9663%" y="303.50">__GI__..</text></g><g><title>_IO_new_file_xsputn (300 samples, 2.84%)</title><rect x="85.8913%" y="277" width="2.8369%" height="15" fill="rgb(219,133,21)"/><text x="86.1413%" y="287.50">_I..</text></g><g><title>__mempcpy_avx_unaligned_erms (14 samples, 0.13%)</title><rect x="88.5957%" y="261" width="0.1324%" height="15" fill="rgb(246,46,29)"/><text x="88.8457%" y="271.50"></text></g><g><title>std::__1::__pad_and_output&lt;char, std::__1::char_traits&lt;char&gt; &gt; (673 samples, 6.36%)</title><rect x="82.5154%" y="325" width="6.3641%" height="15" fill="rgb(246,185,52)"/><text x="82.7654%" y="335.50">std::__1..</text></g><g><title>std::__1::ios_base::width (16 samples, 0.15%)</title><rect x="88.7281%" y="309" width="0.1513%" height="15" fill="rgb(252,136,11)"/><text x="88.9781%" y="319.50"></text></g><g><title>std::__1::basic_ostream&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sentry::sentry (127 samples, 1.20%)</title><rect x="88.9740%" y="325" width="1.2009%" height="15" fill="rgb(219,138,53)"/><text x="89.2240%" y="335.50"></text></g><g><title>std::__1::basic_ostream&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sentry::sentry@plt (14 samples, 0.13%)</title><rect x="90.1749%" y="325" width="0.1324%" height="15" fill="rgb(211,51,23)"/><text x="90.4249%" y="335.50"></text></g><g><title>std::__1::basic_ostream&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sentry::~sentry (112 samples, 1.06%)</title><rect x="90.3073%" y="325" width="1.0591%" height="15" fill="rgb(247,221,28)"/><text x="90.5573%" y="335.50"></text></g><g><title>std::__1::basic_ostream&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sentry::~sentry@plt (12 samples, 0.11%)</title><rect x="91.3664%" y="325" width="0.1135%" height="15" fill="rgb(251,222,45)"/><text x="91.6164%" y="335.50"></text></g><g><title>std::__1::operator&lt;&lt; &lt;char, std::__1::char_traits&lt;char&gt; &gt; (1,050 samples, 9.93%)</title><rect x="81.5981%" y="357" width="9.9291%" height="15" fill="rgb(217,162,53)"/><text x="81.8481%" y="367.50">std::__1::oper..</text></g><g><title>std::__1::__put_character_sequence&lt;char, std::__1::char_traits&lt;char&gt; &gt; (1,047 samples, 9.90%)</title><rect x="81.6265%" y="341" width="9.9007%" height="15" fill="rgb(229,93,14)"/><text x="81.8765%" y="351.50">std::__1::__pu..</text></g><g><title>ostreambuf_iterator (27 samples, 0.26%)</title><rect x="92.4066%" y="325" width="0.2553%" height="15" fill="rgb(209,67,49)"/><text x="92.6566%" y="335.50"></text></g><g><title>[libc++.so.1.0] (27 samples, 0.26%)</title><rect x="93.4468%" y="293" width="0.2553%" height="15" fill="rgb(213,87,29)"/><text x="93.6968%" y="303.50"></text></g><g><title>[libc-2.33.so] (11 samples, 0.10%)</title><rect x="96.8889%" y="261" width="0.1040%" height="15" fill="rgb(205,151,52)"/><text x="97.1389%" y="271.50"></text></g><g><title>__memmove_avx_unaligned_erms (32 samples, 0.30%)</title><rect x="97.0024%" y="261" width="0.3026%" height="15" fill="rgb(253,215,39)"/><text x="97.2524%" y="271.50"></text></g><g><title>std::__1::basic_streambuf&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sputn (430 samples, 4.07%)</title><rect x="93.3050%" y="309" width="4.0662%" height="15" fill="rgb(221,220,41)"/><text x="93.5550%" y="319.50">std:..</text></g><g><title>__GI__IO_fwrite (388 samples, 3.67%)</title><rect x="93.7021%" y="293" width="3.6690%" height="15" fill="rgb(218,133,21)"/><text x="93.9521%" y="303.50">__GI..</text></g><g><title>_IO_new_file_xsputn (138 samples, 1.30%)</title><rect x="96.0662%" y="277" width="1.3050%" height="15" fill="rgb(221,193,43)"/><text x="96.3162%" y="287.50"></text></g><g><title>std::__1::__pad_and_output&lt;char, std::__1::char_traits&lt;char&gt; &gt; (513 samples, 4.85%)</title><rect x="92.6619%" y="325" width="4.8511%" height="15" fill="rgb(240,128,52)"/><text x="92.9119%" y="335.50">std::_..</text></g><g><title>std::__1::ios_base::width (15 samples, 0.14%)</title><rect x="97.3712%" y="309" width="0.1418%" height="15" fill="rgb(253,114,12)"/><text x="97.6212%" y="319.50"></text></g><g><title>std::__1::basic_ostream&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sentry::sentry (50 samples, 0.47%)</title><rect x="97.5792%" y="325" width="0.4728%" height="15" fill="rgb(215,223,47)"/><text x="97.8292%" y="335.50"></text></g><g><title>std::__1::basic_ostream&lt;char, std::__1::char_traits&lt;char&gt; &gt;::sentry::~sentry (159 samples, 1.50%)</title><rect x="98.1087%" y="325" width="1.5035%" height="15" fill="rgb(248,225,23)"/><text x="98.3587%" y="335.50"></text></g><g><title>__libc_start_main (8,450 samples, 79.91%)</title><rect x="19.8487%" y="389" width="79.9054%" height="15" fill="rgb(250,108,0)"/><text x="20.0987%" y="399.50">__libc_start_main</text></g><g><title>main (8,449 samples, 79.90%)</title><rect x="19.8582%" y="373" width="79.8960%" height="15" fill="rgb(228,208,7)"/><text x="20.1082%" y="383.50">main</text></g><g><title>std::__1::operator&lt;&lt; &lt;std::__1::char_traits&lt;char&gt; &gt; (870 samples, 8.23%)</title><rect x="91.5272%" y="357" width="8.2270%" height="15" fill="rgb(244,45,10)"/><text x="91.7772%" y="367.50">std::__1::o..</text></g><g><title>std::__1::__put_character_sequence&lt;char, std::__1::char_traits&lt;char&gt; &gt; (857 samples, 8.10%)</title><rect x="91.6501%" y="341" width="8.1040%" height="15" fill="rgb(207,125,25)"/><text x="91.9001%" y="351.50">std::__1::_..</text></g><g><title>_start (8,471 samples, 80.10%)</title><rect x="19.7730%" y="405" width="80.1040%" height="15" fill="rgb(210,195,18)"/><text x="20.0230%" y="415.50">_start</text></g><g><title>_dl_start (13 samples, 0.12%)</title><rect x="99.7541%" y="389" width="0.1229%" height="15" fill="rgb(249,80,12)"/><text x="100.0041%" y="399.50"></text></g><g><title>_dl_sysdep_start (12 samples, 0.11%)</title><rect x="99.7636%" y="373" width="0.1135%" height="15" fill="rgb(221,65,9)"/><text x="100.0136%" y="383.50"></text></g><g><title>all (10,575 samples, 100%)</title><rect x="0.0000%" y="437" width="100.0000%" height="15" fill="rgb(235,49,36)"/><text x="0.2500%" y="447.50"></text></g><g><title>readdir_clang (10,575 samples, 100.00%)</title><rect x="0.0000%" y="421" width="100.0000%" height="15" fill="rgb(225,32,20)"/><text x="0.2500%" y="431.50">readdir_clang</text></g><g><title>directory_entries_with_paths (13 samples, 0.12%)</title><rect x="99.8771%" y="405" width="0.1229%" height="15" fill="rgb(215,141,46)"/><text x="100.1271%" y="415.50"></text></g></svg></svg>
